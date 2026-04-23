@@ -1,58 +1,67 @@
-"""MDS Precios — MCP server HTTP (para Railway).
+"""MDS Precios — MCP server HTTP con OAuth minimal (para Railway / Claude Cowork).
 
-Expone un endpoint HTTP/Streamable-HTTP que Cowork puede conectar como
-MCP remoto. La herramienta `buscar_precio_partida` busca en DuckDuckGo
-los precios de mercado de una partida de construcción española y
-devuelve media, mínimo, máximo y fuentes.
+Implementa:
+  - MCP streamable-http en /mcp con la herramienta `buscar_precio_partida`
+  - Endpoints OAuth 2.1 minimal para que Cowork pueda registrar el conector:
+      .well-known/oauth-protected-resource
+      .well-known/oauth-authorization-server
+      /register  (dynamic client registration — acepta cualquiera)
+      /authorize (emite código de auth sin pedir nada al usuario)
+      /token     (canjea código por access token válido)
+  - CORS abierto para que Claude pueda hacer la danza desde su UI
 """
 
 import os
 import re
-from urllib.parse import quote_plus, parse_qs, urlparse
+import secrets
+import time
+from urllib.parse import quote_plus, parse_qs, urlparse, urlencode
 
 import httpx
 from bs4 import BeautifulSoup
+
+from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.middleware.cors import CORSMiddleware
+from starlette.responses import JSONResponse, RedirectResponse
+from starlette.routing import Mount, Route
+
 from mcp.server.fastmcp import FastMCP
 
+
+# ========================================================================
+# MCP server
+# ========================================================================
 mcp = FastMCP("mds-precios")
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36")
 
-PRICE_PATTERNS_M2 = [
+PRICE_M2 = [
     re.compile(r'(\d{1,3}(?:[.,]\d{1,2})?)\s*€\s*/?\s*m[²2]', re.IGNORECASE),
     re.compile(r'(\d{1,3}(?:[.,]\d{1,2})?)\s*euros?\s*/?\s*m[²2]', re.IGNORECASE),
     re.compile(r'€\s*(\d{1,3}(?:[.,]\d{1,2})?)\s*/?\s*m[²2]', re.IGNORECASE),
 ]
-PRICE_PATTERNS_UD = [
-    re.compile(r'(\d{1,4}(?:[.,]\d{1,2})?)\s*€\s*/?\s*(?:ud|unidad|uds)\b', re.IGNORECASE),
-]
-PRICE_PATTERNS_ML = [
-    re.compile(r'(\d{1,3}(?:[.,]\d{1,2})?)\s*€\s*/?\s*(?:ml|m\.?l\.?|metro\s+lineal)', re.IGNORECASE),
-]
+PRICE_UD = [re.compile(r'(\d{1,4}(?:[.,]\d{1,2})?)\s*€\s*/?\s*(?:ud|unidad|uds)\b', re.IGNORECASE)]
+PRICE_ML = [re.compile(r'(\d{1,3}(?:[.,]\d{1,2})?)\s*€\s*/?\s*(?:ml|m\.?l\.?|metro\s+lineal)', re.IGNORECASE)]
 
 
-def extract_prices(text: str, unit: str) -> list:
-    patterns = {
-        "m2": PRICE_PATTERNS_M2,
-        "ud": PRICE_PATTERNS_UD,
-        "ml": PRICE_PATTERNS_ML,
-    }.get(unit, PRICE_PATTERNS_M2)
-    lo, hi = {"m2": (5, 500), "ud": (10, 5000), "ml": (3, 300)}.get(unit, (5, 500))
-
+def _extract_prices(text: str, unidad: str) -> list:
+    pats = {"m2": PRICE_M2, "ud": PRICE_UD, "ml": PRICE_ML}.get(unidad, PRICE_M2)
+    lo, hi = {"m2": (5, 500), "ud": (10, 5000), "ml": (3, 300)}.get(unidad, (5, 500))
     out = []
-    for pat in patterns:
-        for m in pat.finditer(text):
+    for p in pats:
+        for m in p.finditer(text):
             try:
-                p = float(m.group(1).replace(",", "."))
-                if lo <= p <= hi:
-                    out.append(p)
+                v = float(m.group(1).replace(",", "."))
+                if lo <= v <= hi:
+                    out.append(v)
             except ValueError:
                 continue
     return out
 
 
-async def ddg_search(query: str, num: int = 8) -> list:
+async def _ddg(query: str, num: int = 8) -> list:
     async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
         r = await c.post("https://html.duckduckgo.com/html/",
                          data={"q": query}, headers={"User-Agent": UA})
@@ -60,9 +69,9 @@ async def ddg_search(query: str, num: int = 8) -> list:
     out = []
     for a in soup.select("a.result__a")[:num]:
         href = a.get("href", "")
-        parsed = urlparse(href)
-        if "duckduckgo.com" in parsed.netloc and "/l/" in parsed.path:
-            qs = parse_qs(parsed.query)
+        p = urlparse(href)
+        if "duckduckgo.com" in p.netloc and "/l/" in p.path:
+            qs = parse_qs(p.query)
             if "uddg" in qs:
                 href = qs["uddg"][0]
         elif href.startswith("//"):
@@ -72,14 +81,14 @@ async def ddg_search(query: str, num: int = 8) -> list:
     return out
 
 
-async def fetch_prices(url: str, unit: str) -> list:
+async def _fetch(url: str, unidad: str) -> list:
     try:
         async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
             r = await c.get(url, headers={"User-Agent": UA})
         if r.status_code != 200:
             return []
         text = BeautifulSoup(r.text, "html.parser").get_text(" ", strip=True)
-        return extract_prices(text, unit)
+        return _extract_prices(text, unidad)
     except Exception:
         return []
 
@@ -88,50 +97,175 @@ async def fetch_prices(url: str, unit: str) -> list:
 async def buscar_precio_partida(partida: str, unidad: str = "m2") -> dict:
     """Busca precios de mercado en España para una partida de construcción.
 
+    Consulta portales públicos (CYPE, Cronoshare, Habitissimo, Reiteman, etc.)
+    vía DuckDuckGo. Devuelve lista de precios encontrados + media + fuentes.
+
     Args:
-        partida: Descripción breve de la partida (ej: "tabique pladur 15+70+15").
-        unidad: "m2", "ud" o "ml". Por defecto "m2".
+        partida: Descripción breve (ej: "tabique pladur 15+70+15 100mm").
+        unidad: "m2" (default), "ud" o "ml".
     """
     query = f"precio {partida} {unidad} España 2026"
-    results = await ddg_search(query, num=8)
-
-    all_prices = []
-    sources = []
+    results = await _ddg(query, 8)
+    all_prices, sources = [], []
     for r in results:
-        prices = await fetch_prices(r["url"], unidad)
+        prices = await _fetch(r["url"], unidad)
         if prices:
             all_prices.extend(prices)
-            sources.append({
-                "titulo": r["title"],
-                "url": r["url"],
-                "precios": sorted(set(prices))[:15],
-            })
-
+            sources.append({"titulo": r["title"], "url": r["url"],
+                            "precios": sorted(set(prices))[:15]})
     if not all_prices:
         return {"partida": partida, "unidad": unidad,
                 "error": "Sin precios encontrados",
                 "urls": [r["url"] for r in results]}
-
     s = sorted(all_prices)
     n = len(s)
-    mediana = s[n // 2] if n % 2 else round((s[n//2-1] + s[n//2]) / 2, 2)
+    med = s[n // 2] if n % 2 else round((s[n // 2 - 1] + s[n // 2]) / 2, 2)
     return {
-        "partida": partida,
-        "unidad": unidad,
-        "num_fuentes": len(sources),
-        "total_precios": len(all_prices),
+        "partida": partida, "unidad": unidad,
+        "num_fuentes": len(sources), "total_precios": len(all_prices),
         "minimo": round(min(all_prices), 2),
         "maximo": round(max(all_prices), 2),
         "media": round(sum(all_prices) / len(all_prices), 2),
-        "mediana": round(mediana, 2),
-        "todos_los_precios": s,
-        "fuentes": sources,
+        "mediana": round(med, 2),
+        "todos_los_precios": s, "fuentes": sources,
     }
 
 
+# ========================================================================
+# OAuth 2.1 minimal — acepta cualquier cliente, emite tokens sin pedir nada
+# ========================================================================
+BASE_URL = os.environ.get("BASE_URL", "https://web-production-303d2.up.railway.app")
+
+_auth_codes: dict[str, dict] = {}
+_tokens: dict[str, float] = {}
+
+
+def _now() -> float:
+    return time.time()
+
+
+async def oauth_protected_resource(request):
+    return JSONResponse({
+        "resource": f"{BASE_URL}/mcp",
+        "authorization_servers": [BASE_URL],
+        "scopes_supported": ["mcp"],
+        "bearer_methods_supported": ["header"],
+    })
+
+
+async def oauth_authorization_server(request):
+    return JSONResponse({
+        "issuer": BASE_URL,
+        "authorization_endpoint": f"{BASE_URL}/authorize",
+        "token_endpoint": f"{BASE_URL}/token",
+        "registration_endpoint": f"{BASE_URL}/register",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "token_endpoint_auth_methods_supported": ["none"],
+        "scopes_supported": ["mcp"],
+        "code_challenge_methods_supported": ["S256", "plain"],
+    })
+
+
+async def register_client(request):
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    client_id = f"client_{secrets.token_urlsafe(12)}"
+    return JSONResponse({
+        "client_id": client_id,
+        "client_id_issued_at": int(_now()),
+        "client_name": data.get("client_name", "MCP Client"),
+        "redirect_uris": data.get("redirect_uris", []),
+        "grant_types": data.get("grant_types", ["authorization_code", "refresh_token"]),
+        "response_types": data.get("response_types", ["code"]),
+        "token_endpoint_auth_method": "none",
+        "scope": "mcp",
+    })
+
+
+async def authorize(request):
+    q = dict(request.query_params)
+    code = f"code_{secrets.token_urlsafe(24)}"
+    _auth_codes[code] = {
+        "client_id": q.get("client_id"),
+        "redirect_uri": q.get("redirect_uri"),
+        "code_challenge": q.get("code_challenge"),
+        "code_challenge_method": q.get("code_challenge_method"),
+        "expires_at": _now() + 600,
+    }
+    redirect_uri = q.get("redirect_uri")
+    if not redirect_uri:
+        return JSONResponse({"error": "missing_redirect_uri"}, status_code=400)
+    params = {"code": code}
+    if q.get("state"):
+        params["state"] = q["state"]
+    return RedirectResponse(f"{redirect_uri}?{urlencode(params)}")
+
+
+async def token_endpoint(request):
+    form = dict(await request.form())
+    grant = form.get("grant_type", "")
+
+    if grant == "authorization_code":
+        code = form.get("code")
+        if code in _auth_codes:
+            del _auth_codes[code]
+        # Sin verificación real — aceptamos cualquier código para este MVP
+    elif grant == "refresh_token":
+        pass
+    else:
+        return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
+
+    access = f"at_{secrets.token_urlsafe(32)}"
+    refresh = f"rt_{secrets.token_urlsafe(32)}"
+    _tokens[access] = _now() + 3600
+    return JSONResponse({
+        "access_token": access,
+        "token_type": "Bearer",
+        "expires_in": 3600,
+        "refresh_token": refresh,
+        "scope": "mcp",
+    })
+
+
+async def health(request):
+    return JSONResponse({"status": "ok", "service": "mds-precios", "endpoint": "/mcp"})
+
+
+# ========================================================================
+# Ensamblar app Starlette con OAuth + MCP mounted en /mcp
+# ========================================================================
+mcp_asgi = mcp.streamable_http_app()
+
+routes = [
+    Route("/", health),
+    Route("/.well-known/oauth-protected-resource", oauth_protected_resource),
+    Route("/.well-known/oauth-protected-resource/mcp", oauth_protected_resource),
+    Route("/.well-known/oauth-authorization-server", oauth_authorization_server),
+    Route("/.well-known/oauth-authorization-server/mcp", oauth_authorization_server),
+    Route("/register", register_client, methods=["POST"]),
+    Route("/authorize", authorize, methods=["GET"]),
+    Route("/token", token_endpoint, methods=["POST"]),
+    Mount("/", app=mcp_asgi),
+]
+
+middleware = [
+    Middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["*"],
+    )
+]
+
+app = Starlette(routes=routes, middleware=middleware)
+
+
 if __name__ == "__main__":
+    import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    # Streamable-HTTP es el transporte moderno para MCP remoto
-    mcp.settings.host = "0.0.0.0"
-    mcp.settings.port = port
-    mcp.run(transport="streamable-http")
+    uvicorn.run(app, host="0.0.0.0", port=port)
