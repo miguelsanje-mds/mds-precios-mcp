@@ -224,41 +224,14 @@ async def health(request):
 
 
 # ========================================================================
-# ASGI wrapper para MCP (maneja scope lifespan + http delegando a session_manager)
+# Starlette app: rutas OAuth + mount de la app MCP oficial (que trae su propio
+# lifespan que inicializa el session_manager)
 # ========================================================================
-async def mcp_asgi_app(scope, receive, send):
-    if scope["type"] == "http":
-        await mcp.session_manager.handle_request(scope, receive, send)
-    elif scope["type"] == "lifespan":
-        while True:
-            msg = await receive()
-            if msg["type"] == "lifespan.startup":
-                await send({"type": "lifespan.startup.complete"})
-            elif msg["type"] == "lifespan.shutdown":
-                await send({"type": "lifespan.shutdown.complete"})
-                return
 
-
-# ========================================================================
-# Starlette app con lifespan que arranca session_manager.run()
-# ========================================================================
-@asynccontextmanager
-async def lifespan(app):
-    async with mcp.session_manager.run():
-        yield
-
-
-routes = [
-    Route("/", health),
-    Route("/.well-known/oauth-protected-resource", oauth_protected_resource),
-    Route("/.well-known/oauth-protected-resource/mcp", oauth_protected_resource),
-    Route("/.well-known/oauth-authorization-server", oauth_authorization_server),
-    Route("/.well-known/oauth-authorization-server/mcp", oauth_authorization_server),
-    Route("/register", register_client, methods=["POST"]),
-    Route("/authorize", authorize, methods=["GET"]),
-    Route("/token", token_endpoint, methods=["POST"]),
-    Mount("/mcp", app=mcp_asgi_app),
-]
+# Hacemos que la app MCP interna responda en "/" de su sub-path,
+# porque vamos a montarla bajo el prefijo "/mcp".
+mcp.settings.streamable_http_path = "/"
+mcp_internal_app = mcp.streamable_http_app()
 
 middleware = [
     Middleware(
@@ -270,6 +243,26 @@ middleware = [
         expose_headers=["*"],
     )
 ]
+
+routes = [
+    Route("/", health),
+    Route("/.well-known/oauth-protected-resource", oauth_protected_resource),
+    Route("/.well-known/oauth-protected-resource/mcp", oauth_protected_resource),
+    Route("/.well-known/oauth-authorization-server", oauth_authorization_server),
+    Route("/.well-known/oauth-authorization-server/mcp", oauth_authorization_server),
+    Route("/register", register_client, methods=["POST"]),
+    Route("/authorize", authorize, methods=["GET"]),
+    Route("/token", token_endpoint, methods=["POST"]),
+    Mount("/mcp", app=mcp_internal_app),
+]
+
+
+@asynccontextmanager
+async def lifespan(app):
+    # session_manager ya existe porque mcp_internal_app se ha creado arriba
+    async with mcp.session_manager.run():
+        yield
+
 
 app = Starlette(routes=routes, middleware=middleware, lifespan=lifespan)
 
