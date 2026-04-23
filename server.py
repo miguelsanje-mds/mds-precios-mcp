@@ -1,20 +1,10 @@
-"""MDS Precios — MCP server HTTP con OAuth minimal (para Railway / Claude Cowork).
-
-Implementa:
-  - MCP streamable-http en /mcp con la herramienta `buscar_precio_partida`
-  - Endpoints OAuth 2.1 minimal para que Cowork pueda registrar el conector:
-      .well-known/oauth-protected-resource
-      .well-known/oauth-authorization-server
-      /register  (dynamic client registration — acepta cualquiera)
-      /authorize (emite código de auth sin pedir nada al usuario)
-      /token     (canjea código por access token válido)
-  - CORS abierto para que Claude pueda hacer la danza desde su UI
-"""
+"""MDS Precios — MCP server HTTP con OAuth minimal (Railway)."""
 
 import os
 import re
 import secrets
 import time
+from contextlib import asynccontextmanager
 from urllib.parse import quote_plus, parse_qs, urlparse, urlencode
 
 import httpx
@@ -132,7 +122,7 @@ async def buscar_precio_partida(partida: str, unidad: str = "m2") -> dict:
 
 
 # ========================================================================
-# OAuth 2.1 minimal — acepta cualquier cliente, emite tokens sin pedir nada
+# OAuth 2.1 minimal
 # ========================================================================
 BASE_URL = os.environ.get("BASE_URL", "https://web-production-303d2.up.railway.app")
 
@@ -212,7 +202,6 @@ async def token_endpoint(request):
         code = form.get("code")
         if code in _auth_codes:
             del _auth_codes[code]
-        # Sin verificación real — aceptamos cualquier código para este MVP
     elif grant == "refresh_token":
         pass
     else:
@@ -231,13 +220,33 @@ async def token_endpoint(request):
 
 
 async def health(request):
-    return JSONResponse({"status": "ok", "service": "mds-precios", "endpoint": "/mcp"})
+    return JSONResponse({"status": "ok", "service": "mds-precios"})
 
 
 # ========================================================================
-# Ensamblar app Starlette con OAuth + MCP mounted en /mcp
+# ASGI wrapper para MCP (maneja scope lifespan + http delegando a session_manager)
 # ========================================================================
-mcp_asgi = mcp.streamable_http_app()
+async def mcp_asgi_app(scope, receive, send):
+    if scope["type"] == "http":
+        await mcp.session_manager.handle_request(scope, receive, send)
+    elif scope["type"] == "lifespan":
+        while True:
+            msg = await receive()
+            if msg["type"] == "lifespan.startup":
+                await send({"type": "lifespan.startup.complete"})
+            elif msg["type"] == "lifespan.shutdown":
+                await send({"type": "lifespan.shutdown.complete"})
+                return
+
+
+# ========================================================================
+# Starlette app con lifespan que arranca session_manager.run()
+# ========================================================================
+@asynccontextmanager
+async def lifespan(app):
+    async with mcp.session_manager.run():
+        yield
+
 
 routes = [
     Route("/", health),
@@ -248,7 +257,7 @@ routes = [
     Route("/register", register_client, methods=["POST"]),
     Route("/authorize", authorize, methods=["GET"]),
     Route("/token", token_endpoint, methods=["POST"]),
-    Mount("/", app=mcp_asgi),
+    Mount("/mcp", app=mcp_asgi_app),
 ]
 
 middleware = [
@@ -262,7 +271,7 @@ middleware = [
     )
 ]
 
-app = Starlette(routes=routes, middleware=middleware)
+app = Starlette(routes=routes, middleware=middleware, lifespan=lifespan)
 
 
 if __name__ == "__main__":
